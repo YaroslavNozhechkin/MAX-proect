@@ -4,7 +4,7 @@ Webhook handlers for processing incoming messages from GREEN-API (Max).
 
 import logging
 from typing import Dict, Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.config import settings
 from app.telegram_client import telegram_client
@@ -46,10 +46,10 @@ class WebhookHandler:
         if not self.target_chat_id:
             return True
 
-        # Process only messages from target chat
-        return chat_id == self.target_chat_id
+        # Compare as strings (env is string, webhook can be int)
+        return str(chat_id) == str(self.target_chat_id)
 
-    async def handle_incoming_message(self, payload: Dict[str, Any]) -> Dict[str, str]:
+    async def handle_incoming_message(self, payload: Any) -> Dict[str, Any]:
         """
         Handle incoming webhook from GREEN-API.
 
@@ -60,31 +60,40 @@ class WebhookHandler:
             Dict with status
         """
         try:
+            # 0) Sometimes payload may be a batch (list of notifications)
+            if isinstance(payload, list):
+                results = []
+                for item in payload:
+                    results.append(await self.handle_incoming_message(item))
+                return {"status": "batch", "results": results}
+
+            if not isinstance(payload, dict):
+                logger.warning(f"Unsupported payload type: {type(payload)}")
+                return {"status": "ignored", "reason": "invalid_payload"}
+
+            # 1) GREEN-API can send either:
+            #    a) flat webhook: { "typeWebhook": "...", ... }
+            #    b) wrapper: { "receiptId": ..., "body": { "typeWebhook": "...", ... } }
+            notification = payload
+            if isinstance(payload.get("body"), dict):
+                notification = payload["body"]
+
             # Parse webhook type
-            webhook_type = payload.get("typeWebhook")
+            webhook_type = notification.get("typeWebhook")
             logger.info(f"Received webhook type: {webhook_type}")
 
-            # We're interested in incoming and outgoing message notifications
-            if webhook_type not in [
-                "incomingMessageReceived",
-                "incomingCall",
-                "outgoingMessageReceived",
-                "outgoingAPIMessageReceived",
-            ]:
-                logger.debug(f"Ignoring webhook type: {webhook_type}")
-                return {"status": "ignored", "reason": "not_a_message"}
-
-            # Log full payload for debugging outgoing messages
-            if "outgoing" in webhook_type.lower():
-                logger.info(f"Outgoing webhook payload: {payload}")
+            # 2) You need ONLY MAX -> Telegram, so accept ONLY incoming messages
+            if webhook_type != "incomingMessageReceived":
+                return {"status": "ignored", "reason": "not_incoming"}
 
             # Extract message data
-            message_data = payload.get("messageData", {})
-            sender_data = payload.get("senderData", {})
-            instance_data = payload.get("instanceData", {})
+            message_data = notification.get("messageData", {}) or {}
+            sender_data = notification.get("senderData", {}) or {}
 
             # Get chat ID to check filter
             chat_id = sender_data.get("chatId") or sender_data.get("sender")
+            if chat_id is not None:
+                chat_id = str(chat_id)
 
             if not self.should_process_message(chat_id):
                 logger.info(f"Skipping message from chat {chat_id} (not target chat)")
@@ -92,7 +101,12 @@ class WebhookHandler:
 
             # Extract sender info
             sender_name = sender_data.get("senderName") or sender_data.get("name")
-            sender_phone = sender_data.get("sender", "").replace("@c.us", "")
+
+            # For MAX sender may not be a phone number; try senderPhoneNumber first, fallback to sender
+            sender_phone = sender_data.get("senderPhoneNumber")
+            if sender_phone is None or str(sender_phone) == "0":
+                sender_phone = sender_data.get("sender", "")
+            sender_phone = str(sender_phone).replace("@c.us", "")
 
             # Process based on message type
             type_message = message_data.get("typeMessage")
@@ -113,7 +127,7 @@ class WebhookHandler:
                 await self._handle_voice_message(message_data, sender_name, sender_phone)
             else:
                 logger.warning(f"Unsupported message type: {type_message}")
-                return {"status": "unsupported", "type": type_message}
+                return {"status": "unsupported", "type": str(type_message)}
 
             return {"status": "success"}
 
