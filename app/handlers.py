@@ -2,9 +2,10 @@
 Webhook handlers for processing incoming messages from GREEN-API (Max).
 """
 
+import json
 import logging
-from typing import Dict, Any, Optional
-from pydantic import BaseModel
+from typing import Dict, Any, Optional, List, Union
+from pydantic import BaseModel, Field  # Field может быть не нужен, оставляю для совместимости
 
 from app.config import settings
 from app.telegram_client import telegram_client
@@ -49,6 +50,62 @@ class WebhookHandler:
         # Compare as strings (env is string, webhook can be int)
         return str(chat_id) == str(self.target_chat_id)
 
+    def _unwrap_notification(self, payload: Any) -> Dict[str, Any]:
+        """
+        GREEN-API can send:
+          - flat webhook: { "typeWebhook": "...", ... }
+          - wrapper: { "receiptId": ..., "body": { ... } }
+          - wrapper with body as JSON string: { "receiptId": ..., "body": "{...}" }
+
+        This function unwraps body up to a few levels defensively.
+        """
+        if not isinstance(payload, dict):
+            return {}
+
+        obj: Any = payload
+
+        for _ in range(5):
+            if isinstance(obj, dict) and "typeWebhook" in obj:
+                return obj
+
+            if not isinstance(obj, dict):
+                break
+
+            body = obj.get("body")
+
+            if isinstance(body, str):
+                # body may be JSON string
+                try:
+                    body = json.loads(body)
+                except Exception:
+                    break
+
+            if isinstance(body, dict):
+                obj = body
+                continue
+
+            break
+
+        return obj if isinstance(obj, dict) else {}
+
+    def _find_dict_with_key(self, obj: Any, key: str) -> Optional[Dict[str, Any]]:
+        """
+        Find the first dict in nested structures (dict/list) that contains `key`.
+        """
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj
+            for v in obj.values():
+                found = self._find_dict_with_key(v, key)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = self._find_dict_with_key(item, key)
+                if found is not None:
+                    return found
+        return None
+
     async def handle_incoming_message(self, payload: Any) -> Dict[str, Any]:
         """
         Handle incoming webhook from GREEN-API.
@@ -62,7 +119,7 @@ class WebhookHandler:
         try:
             # 0) Sometimes payload may be a batch (list of notifications)
             if isinstance(payload, list):
-                results = []
+                results: List[Dict[str, Any]] = []
                 for item in payload:
                     results.append(await self.handle_incoming_message(item))
                 return {"status": "batch", "results": results}
@@ -71,26 +128,40 @@ class WebhookHandler:
                 logger.warning(f"Unsupported payload type: {type(payload)}")
                 return {"status": "ignored", "reason": "invalid_payload"}
 
-            # 1) GREEN-API can send either:
-            #    a) flat webhook: { "typeWebhook": "...", ... }
-            #    b) wrapper: { "receiptId": ..., "body": { "typeWebhook": "...", ... } }
-            notification = payload
-            if isinstance(payload.get("body"), dict):
-                notification = payload["body"]
+            # Диагностика структуры (без полного JSON)
+            logger.info(f"Webhook top keys: {list(payload.keys())}")
+            if "body" in payload:
+                logger.info(f"Webhook has body, type: {type(payload.get('body')).__name__}")
 
-            # Parse webhook type
-            webhook_type = notification.get("typeWebhook")
-            logger.info(f"Received webhook type: {webhook_type}")
+            # 1) Unwrap common wrapper formats
+            notification = self._unwrap_notification(payload)
 
-            # 2) You need ONLY MAX -> Telegram, so accept ONLY incoming messages
+            # 2) Determine webhook type robustly
+            base = notification if isinstance(notification, dict) and "typeWebhook" in notification else None
+            if base is None:
+                base = self._find_dict_with_key(payload, "typeWebhook") or notification
+
+            webhook_type = None
+            if isinstance(base, dict):
+                webhook_type = base.get("typeWebhook")
+
+            logger.info(f"Получен тип вебхука: {webhook_type}")
+
+            # 3) Вам нужно ТОЛЬКО MAX -> Telegram, значит берём только входящие сообщения
             if webhook_type != "incomingMessageReceived":
                 return {"status": "ignored", "reason": "not_incoming"}
 
-            # Extract message data
-            message_data = notification.get("messageData", {}) or {}
-            sender_data = notification.get("senderData", {}) or {}
+            # 4) Extract message data (from the same base dict that has typeWebhook)
+            message_data = (base.get("messageData") if isinstance(base, dict) else None) or {}
+            sender_data = (base.get("senderData") if isinstance(base, dict) else None) or {}
 
-            # Get chat ID to check filter
+            # Defensive fallback: sometimes fields can be nested differently
+            if not isinstance(message_data, dict):
+                message_data = {}
+            if not isinstance(sender_data, dict):
+                sender_data = {}
+
+            # 5) Chat filter
             chat_id = sender_data.get("chatId") or sender_data.get("sender")
             if chat_id is not None:
                 chat_id = str(chat_id)
@@ -99,7 +170,7 @@ class WebhookHandler:
                 logger.info(f"Skipping message from chat {chat_id} (not target chat)")
                 return {"status": "ignored", "reason": "chat_filter"}
 
-            # Extract sender info
+            # 6) Sender info
             sender_name = sender_data.get("senderName") or sender_data.get("name")
 
             # For MAX sender may not be a phone number; try senderPhoneNumber first, fallback to sender
@@ -108,12 +179,13 @@ class WebhookHandler:
                 sender_phone = sender_data.get("sender", "")
             sender_phone = str(sender_phone).replace("@c.us", "")
 
-            # Process based on message type
+            # 7) Process based on message type
             type_message = message_data.get("typeMessage")
 
             if type_message == "textMessage":
                 await self._handle_text_message(message_data, sender_name, sender_phone)
             elif type_message == "extendedTextMessage":
+                # редко, но оставляем
                 await self._handle_extended_text_message(message_data, sender_name, sender_phone)
             elif type_message == "imageMessage":
                 await self._handle_image_message(message_data, sender_name, sender_phone)
@@ -146,7 +218,7 @@ class WebhookHandler:
     async def _handle_extended_text_message(
         self, message_data: Dict[str, Any], sender_name: Optional[str], sender_phone: Optional[str]
     ):
-        """Handle extended text message (outgoing messages from GREEN-API)."""
+        """Handle extended text message."""
         text = message_data.get("extendedTextMessageData", {}).get("text", "")
         if text:
             await telegram_client.send_text_message(text, sender_name, sender_phone)
