@@ -131,25 +131,6 @@ async def health_check():
 async def webhook_endpoint(request: Request):
     """
     Webhook endpoint for receiving messages from GREEN-API (Max → Telegram).
-
-    Expected format from GREEN-API:
-    {
-        "typeWebhook": "incomingMessageReceived",
-        "instanceData": {...},
-        "timestamp": 1234567890,
-        "idMessage": "...",
-        "senderData": {
-            "chatId": "...",
-            "sender": "...",
-            "senderName": "..."
-        },
-        "messageData": {
-            "typeMessage": "textMessage",
-            "textMessageData": {
-                "textMessage": "Hello"
-            }
-        }
-    }
     """
     try:
         # Check if Max → Telegram is enabled
@@ -173,8 +154,11 @@ async def webhook_endpoint(request: Request):
 
         # Process webhook
         result = await webhook_handler.handle_incoming_message(payload)
-
         return JSONResponse(content=result, status_code=200)
+
+    except HTTPException as e:
+        # IMPORTANT: Do not convert HTTP errors (401/403) to 500.
+        return JSONResponse(content={"status": "error", "detail": e.detail}, status_code=e.status_code)
 
     except Exception as e:
         logger.error(f"Error processing webhook: {e}", exc_info=True)
@@ -185,17 +169,6 @@ async def webhook_endpoint(request: Request):
 async def telegram_webhook_endpoint(request: Request):
     """
     Webhook endpoint for receiving messages from Telegram Bot API (Telegram → Max).
-
-    Expected format from Telegram:
-    {
-        "update_id": 12345,
-        "message": {
-            "message_id": 123,
-            "from": {...},
-            "chat": {...},
-            "text": "Hello"
-        }
-    }
     """
     try:
         # Check if Telegram → Max is enabled
@@ -227,6 +200,9 @@ async def telegram_webhook_endpoint(request: Request):
                 content={"status": "error", "message": "Handler not initialized"}, status_code=500
             )
 
+    except HTTPException as e:
+        return JSONResponse(content={"status": "error", "detail": e.detail}, status_code=e.status_code)
+
     except Exception as e:
         logger.error(f"Error processing Telegram webhook: {e}", exc_info=True)
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
@@ -241,7 +217,6 @@ async def test_endpoint(request: Request):
         sender_name = data.get("sender_name", "Test User")
 
         await telegram_client.send_text_message(text, sender_name=sender_name)
-
         return {"status": "success", "message": "Test message sent to Telegram"}
 
     except Exception as e:
